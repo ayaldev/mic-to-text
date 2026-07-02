@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mic-to-text</title>
+    <style>
+        /* Import clean fallback developer monospaced typography */
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+        :root {
+            /* dnscheck.tools inspired crisp dark color palette */
+            --bg-color: #0c0d0e;
+            --text-color: #f0f3f6;
+            --border-color: #2d3139;
+            --panel-bg: #161a22;
+            --btn-bg: #21262d;
+            --btn-hover: #30363d;
+            --btn-border: #30363d;
+            --font-size: 4.5rem;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            /* Primary target: Google Code Sans / Google Sans Mono / JetBrains Fallbacks */
+            font-family: 'Google Code Sans', 'Google Sans Mono', 'JetBrains Mono', ui-monospace, SFMono-Regular, Consolas, monospace;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            overflow: hidden;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end;
+            position: relative;
+            letter-spacing: -0.01em;
+        }
+
+        /* Fullscreen Background Waveform Canvas */
+        #audio-monitor {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            width: 100%;
+            height: 25vh;
+            z-index: 1;
+            pointer-events: none;
+            opacity: 0.25;
+        }
+
+        /* Caption Presentation Space */
+        #caption-container {
+            width: 100%;
+            height: 100vh;
+            overflow-y: auto;
+            font-size: var(--font-size);
+            font-weight: 700;
+            line-height: 1.4;
+            z-index: 2;
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end;
+            padding: 7rem 3rem 4rem 3rem;
+        }
+
+        #caption-container::-webkit-scrollbar {
+            width: 0px;
+            background: transparent;
+        }
+
+        #caption-wrapper {
+            display: inline;
+            word-wrap: break-word;
+        }
+
+        /* Ultra-Fast Typing Animation */
+        .word {
+            display: inline-block;
+            opacity: 0;
+            transform: scale(0.98) translateY(2px);
+            animation: instantWord 0.05s cubic-bezier(0, 0, 0.2, 1) forwards;
+            margin-right: 0.3ch;
+        }
+
+        @keyframes instantWord {
+            to {
+                opacity: 1;
+                transform: scale(1) translateY(0);
+            }
+        }
+
+        /* Flat Control Row (Mimicking dnscheck.tools toolbars) */
+        #floating-controls {
+            position: absolute;
+            top: 1.5rem;
+            right: 1.5rem;
+            display: flex;
+            flex-direction: row;
+            gap: 0.35rem;
+            background: var(--panel-bg);
+            padding: 0.35rem;
+            border-radius: 6px;
+            border: 1px solid var(--border-color);
+            z-index: 100;
+            transition: opacity 0.3s ease;
+        }
+
+        #floating-controls.hidden {
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        /* Boxy, flat utility buttons replacing bulky circular ones */
+        .btn-circle {
+            width: 38px;
+            height: 38px;
+            border-radius: 4px;
+            background: var(--btn-bg);
+            color: #c9d1d9;
+            border: 1px solid var(--btn-border);
+            font-family: inherit;
+            font-size: 1.1rem;
+            font-weight: 500;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+        }
+
+        .btn-circle:hover {
+            background: var(--btn-hover);
+            border-color: #8b949e;
+            color: #ffffff;
+        }
+
+        /* Diagnostic Box Error Banner */
+        #error-display {
+            position: absolute;
+            bottom: 2rem;
+            left: 3rem;
+            font-size: 0.95rem;
+            color: #ff7b72;
+            background: rgba(248, 81, 73, 0.1);
+            border: 1px solid rgba(248, 81, 73, 0.4);
+            padding: 0.6rem 1rem;
+            border-radius: 6px;
+            font-weight: 500;
+            z-index: 3;
+            display: none;
+        }
+    </style>
+</head>
+
+<body>
+
+    <canvas id="audio-monitor"></canvas>
+
+    <div id="floating-controls">
+        <button class="btn-circle" id="zoom-in-btn" title="Increase Text Size">+</button>
+        <button class="btn-circle" id="zoom-out-btn" title="Decrease Text Size">−</button>
+        <button class="btn-circle" id="fullscreen-btn" title="Toggle Fullscreen">⛶</button>
+    </div>
+
+    <div id="error-display">⚠️ Microphone Access Denied / Hardware Interface Disconnected</div>
+
+    <div id="caption-container">
+        <div id="caption-wrapper"></div>
+    </div>
+
+    <script>
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SpeechRecognition) {
+            alert("Please open this app in Google Chrome or Microsoft Edge for native speech features.");
+        }
+
+        const zoomInBtn = document.getElementById('zoom-in-btn');
+        const zoomOutBtn = document.getElementById('zoom-out-btn');
+        const fullscreenBtn = document.getElementById('fullscreen-btn');
+        const floatingControls = document.getElementById('floating-controls');
+        const container = document.getElementById('caption-container');
+        const wrapper = document.getElementById('caption-wrapper');
+        const errorDisplay = document.getElementById('error-display');
+        const canvas = document.getElementById('audio-monitor');
+        const canvasCtx = canvas.getContext('2d');
+
+        let recognition;
+        let controlTimeout;
+        let watchdogInterval;
+        let currentFontSize = 4.5;
+
+        let audioCtx;
+        let analyser;
+        let dataArray;
+        let source;
+
+        let committedWordCount = 0;
+        let lastVisualTextTime = Date.now();
+        let forceResetting = false;
+
+        // Track states: 'working', 'counting', 'reconnecting', 'terminated'
+        let connectionState = 'working';
+
+        function initRecognition() {
+            if (recognition) {
+                try {
+                    recognition.onend = null;
+                    recognition.onerror = null;
+                    recognition.onresult = null;
+                    recognition.abort();
+                } catch (e) { console.log("Cleaned up stalled instance."); }
+                recognition = null;
+            }
+
+            recognition = new SpeechRecognition();
+            recognition.continuous = true;
+            recognition.interimResults = true;
+            recognition.lang = 'fil-PH';
+
+            recognition.onend = () => {
+                if (!forceResetting) {
+                    console.log("[SYSTEM] Stream dropped. Re-establishing connection matrix...");
+                    connectionState = 'reconnecting';
+                    safelyStartRecognition();
+                }
+            };
+
+            recognition.onerror = (event) => {
+                console.error("[SPEECH ERROR]:", event.error);
+                if (event.error === 'network') {
+                    connectionState = 'terminated';
+                    lastVisualTextTime = 0;
+                }
+            };
+
+            recognition.onresult = (event) => {
+                let interimScript = "";
+                let finalScript = "";
+
+                for (let i = event.resultIndex; i < event.results.length; ++i) {
+                    if (event.results[i].isFinal) {
+                        finalScript += event.results[i][0].transcript;
+                    } else {
+                        interimScript += event.results[i][0].transcript;
+                    }
+                }
+
+                let combinedTranscript = (finalScript + interimScript).trim();
+                if (combinedTranscript) {
+                    processCompleteWordsOnly(combinedTranscript);
+                }
+            };
+        }
+
+        function safelyStartRecognition() {
+            try {
+                recognition.start();
+                if (connectionState !== 'terminated' && connectionState !== 'reconnecting') {
+                    connectionState = 'working';
+                }
+            } catch (e) {
+                connectionState = 'reconnecting';
+                initRecognition();
+                try {
+                    recognition.start();
+                    if (connectionState !== 'terminated') connectionState = 'working';
+                } catch (err) {
+                    console.error("Hard recovery failed:", err);
+                    connectionState = 'terminated';
+                }
+            }
+        }
+
+        function processCompleteWordsOnly(fullText) {
+            const allWords = fullText.split(/\s+/);
+
+            let totalCompleteWords = allWords.length;
+            if (!fullText.endsWith(' ')) {
+                totalCompleteWords = allWords.length - 1;
+            }
+
+            if (totalCompleteWords > committedWordCount) {
+                for (let i = committedWordCount; i < totalCompleteWords; i++) {
+                    if (allWords[i].trim()) {
+                        appendWordElement(allWords[i].trim());
+                    }
+                }
+                committedWordCount = totalCompleteWords;
+
+                lastVisualTextTime = Date.now();
+                if (connectionState !== 'terminated') {
+                    connectionState = 'working';
+                }
+            }
+        }
+
+        function appendWordElement(word) {
+            const span = document.createElement('span');
+            span.className = 'word';
+            span.textContent = word;
+            wrapper.appendChild(span);
+            wrapper.appendChild(document.createTextNode(' '));
+
+            if (wrapper.childNodes.length > 300) {
+                for (let i = 0; i < 20; i++) {
+                    if (wrapper.firstChild) wrapper.removeChild(wrapper.firstChild);
+                }
+                committedWordCount = Math.max(0, committedWordCount - 10);
+            }
+            container.scrollTop = container.scrollHeight;
+        }
+
+        function startAggressiveWatchdog() {
+            clearInterval(watchdogInterval);
+
+            watchdogInterval = setInterval(() => {
+                if (connectionState === 'terminated') return;
+
+                const timeSinceLastVisualChange = Date.now() - lastVisualTextTime;
+
+                if (timeSinceLastVisualChange >= 3000) {
+                    console.warn(`[WATCHDOG] Stagnant for ${timeSinceLastVisualChange}ms. Forcing matrix reset.`);
+
+                    connectionState = 'reconnecting';
+                    forceResetting = true;
+                    committedWordCount = 0;
+
+                    initRecognition();
+                    safelyStartRecognition();
+
+                    lastVisualTextTime = Date.now();
+                    forceResetting = false;
+                } else if (timeSinceLastVisualChange > 200) {
+                    connectionState = 'counting';
+                }
+            }, 100);
+        }
+
+        async function setupAudioMonitor() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                errorDisplay.style.display = "none";
+
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                analyser = audioCtx.createAnalyser();
+                analyser.fftSize = 512;
+
+                source = audioCtx.createMediaStreamSource(stream);
+                source.connect(analyser);
+
+                const bufferLength = analyser.frequencyBinCount;
+                dataArray = new Uint8Array(bufferLength);
+
+                resizeCanvas();
+                window.addEventListener('resize', resizeCanvas);
+                drawWaveform();
+
+                initRecognition();
+                safelyStartRecognition();
+                startAggressiveWatchdog();
+
+            } catch (err) {
+                console.error("Audio interface hardware connection drop:", err);
+                errorDisplay.style.display = "block";
+                connectionState = 'terminated';
+            }
+        }
+
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight * 0.25;
+        }
+
+        function drawWaveform() {
+            requestAnimationFrame(drawWaveform);
+            analyser.getByteTimeDomainData(dataArray);
+
+            canvasCtx.clearRect(0, 0, canvas.width, canvas.height);
+            canvasCtx.lineWidth = 2.5;
+
+            // Diagnostic dashboard metric colors mapped directly to state nodes
+            if (connectionState === 'working') {
+                canvasCtx.strokeStyle = '#22c55e'; // Success / Active Green
+            } else if (connectionState === 'counting') {
+                canvasCtx.strokeStyle = '#e6edf2'; // Neutral Standby Grayish White
+            } else if (connectionState === 'reconnecting') {
+                canvasCtx.strokeStyle = '#eab308'; // Rerouting / Sync Warning Amber
+            } else if (connectionState === 'terminated') {
+                canvasCtx.strokeStyle = '#f85149'; // Error Red
+            }
+
+            canvasCtx.beginPath();
+
+            const sliceWidth = canvas.width * 1.0 / dataArray.length;
+            let x = 0;
+
+            for (let i = 0; i < dataArray.length; i++) {
+                const v = dataArray[i] / 128.0;
+                const y = (v * canvas.height / 2);
+
+                if (i === 0) canvasCtx.moveTo(x, y);
+                else canvasCtx.lineTo(x, y);
+
+                x += sliceWidth;
+            }
+
+            canvasCtx.lineTo(canvas.width, canvas.height / 2);
+            canvasCtx.stroke();
+        }
+
+        zoomInBtn.addEventListener('click', () => {
+            if (currentFontSize < 10) {
+                currentFontSize += 0.5;
+                document.documentElement.style.setProperty('--font-size', `${currentFontSize}rem`);
+                container.scrollTop = container.scrollHeight;
+            }
+        });
+
+        zoomOutBtn.addEventListener('click', () => {
+            if (currentFontSize > 2) {
+                currentFontSize -= 0.5;
+                document.documentElement.style.setProperty('--font-size', `${currentFontSize}rem`);
+                container.scrollTop = container.scrollHeight;
+            }
+        });
+
+        fullscreenBtn.addEventListener('click', () => {
+            if (!document.fullscreenElement) {
+                document.documentElement.requestFullscreen();
+                fullscreenBtn.textContent = "Exit";
+                fullscreenBtn.style.fontSize = "0.75rem";
+            } else {
+                document.exitFullscreen();
+                fullscreenBtn.textContent = "⛶";
+                fullscreenBtn.style.fontSize = "1.1rem";
+            }
+        });
+
+        function hideControlsWatcher() {
+            floatingControls.classList.remove('hidden');
+            clearTimeout(controlTimeout);
+            controlTimeout = setTimeout(() => {
+                floatingControls.classList.add('hidden');
+            }, 3000);
+        }
+        window.addEventListener('mousemove', hideControlsWatcher);
+        window.addEventListener('click', hideControlsWatcher);
+
+        window.addEventListener('DOMContentLoaded', setupAudioMonitor);
+    </script>
+</body>
+
+</html>
